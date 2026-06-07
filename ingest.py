@@ -11,9 +11,12 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 CHROMA_PATH = "./chroma_db"
 COLLECTION_NAME = "istqb_knowledge"
-# Phase 1 (backup) : on pointe sur corpus/genai pour préparer le multi-certif.
-# Quand on ajoutera Foundation, ce sera corpus/foundation, etc.
-DOCUMENTS_PATH = "./corpus/genai"
+# Phase 2 : on ingère uniquement le syllabus officiel ISTQB GenAI.
+# Les autres sous-dossiers (cours/, faq/, quiz/, revision/) sont volontairement
+# ignorés : le site a déjà cours + quiz, le bot ne sert qu'à la révision basée
+# sur la source officielle.
+# Quand on ajoutera Foundation, ce sera ./corpus/foundation/syllabus, etc.
+DOCUMENTS_PATH = "./corpus/genai/syllabus"
 
 # Reset propre de la base
 if os.path.exists(CHROMA_PATH):

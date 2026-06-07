@@ -10,27 +10,29 @@ propre collection ChromaDB, mais partage le même code applicatif.
 
 ```
 istqb-chatbots/
-├── app.py              ← Application Streamlit (dev/debug local — phase 1)
+├── api.py              ← Application FastAPI (phase 2 — consommée par le frontend)
+├── app.py              ← Ancienne UI Streamlit (conservée pour debug local)
 ├── ingest.py           ← Pipeline d'ingestion (chunke + embeddings + Chroma)
 ├── corpus/             ← Documents bruts, organisés par certification
 │   └── genai/
-│       ├── cours/      ← Explications pédagogiques par chapitre
-│       ├── faq/        ← Foire aux questions
-│       ├── quiz/       ← Questions d'auto-évaluation
-│       ├── revision/   ← Fiches de révision
-│       └── syllabus/   ← Syllabus officiel ISTQB
+│       └── syllabus/   ← Syllabus officiel ISTQB GenAI (seul ingéré)
 ├── chroma_db/          ← Vector store local (gitignored, régénéré via ingest.py)
 ├── venv/               ← Environnement Python (gitignored)
 ├── .env                ← Clés API (gitignored — voir .env.example)
 └── requirements.txt
 ```
 
+> **Note** : les sous-dossiers `cours/`, `faq/`, `quiz/`, `revision/` du corpus existent
+> mais ne sont **pas** ingérés. Le site certif-academy a déjà ces contenus en interne ;
+> le chatbot ne sert qu'à la révision basée sur la source officielle (syllabus).
+
 ## Stack technique
 
 - **Embeddings** : OpenAI `text-embedding-3-small`
 - **LLM** : OpenAI `gpt-4.1-mini` (température 0.1)
 - **Vector store** : ChromaDB (persistant local)
-- **UI** : Streamlit (phase 1, dev/debug)
+- **API** : FastAPI + Uvicorn (phase 2)
+- **UI legacy** : Streamlit (phase 1, conservée pour debug)
 
 ## Démarrage rapide
 
@@ -44,28 +46,80 @@ pip install -r requirements.txt
 cp .env.example .env
 # → ouvre .env et colle ta vraie OPENAI_API_KEY
 
-# 3. Ingérer le corpus
+# 3. Ingérer le corpus (à refaire après tout changement dans corpus/)
 python ingest.py
 
-# 4. Lancer
+# 4a. Lancer en mode API (consommée par le frontend certif-academy)
+uvicorn api:app --reload --port 8000
+
+# 4b. (ou) lancer l'ancienne UI Streamlit pour tester en local
 streamlit run app.py
+```
+
+## Endpoints API
+
+### `GET /health`
+
+Sonde de vie. Retourne `{"status": "ok", "model": "...", "collection": "..."}`.
+
+### `POST /chat`
+
+Pose une question au chatbot.
+
+**Body :**
+```json
+{
+  "question": "Qu'est-ce qu'un prompt injection ?",
+  "history": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ]
+}
+```
+
+**Réponse :**
+```json
+{
+  "answer": "Définition :\n...\n\n📍 À réviser : Chapitre 4 — Section 4.2",
+  "sources": ["syllabus / chapitre_4_syllabus.md"],
+  "chapter_hint": "Chapitre 4"
+}
+```
+
+L'historique est facultatif. Côté frontend, on envoie idéalement les 10 derniers
+messages (5 échanges) pour assurer la mémoire conversationnelle.
+
+### Test rapide
+
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Définis prompt injection.", "history": []}'
 ```
 
 ## Stratégie de retrieve
 
-Le système actuel privilégie la **section** comme unité de réponse :
+Le système privilégie la **section** comme unité de réponse :
 
-1. Top 12 chunks récupérés par similarité d'embedding
+1. Top 12 chunks récupérés par similarité d'embedding (filtre `category=syllabus`)
 2. Chunks regroupés par (chapitre, section)
 3. La section avec le plus de chunks "matchés" devient le contexte principal
 
 Cette approche évite le mélange de chapitres et garantit une réponse cohérente, ancrée
 dans une seule partie du syllabus.
 
-## Suite (phase 2)
+## CORS
 
-- Portage Streamlit → FastAPI (endpoint REST `/chat`)
-- Paramétrage par certification (collection + system prompt + filtres)
+`api.py` autorise par défaut `http://localhost:5173` (Vite), `http://localhost:3000`
+et `http://127.0.0.1:5173`. Pour ajuster, définir `ALLOWED_ORIGINS` dans `.env` :
+
+```
+ALLOWED_ORIGINS=http://localhost:5173,https://certif-academy.example.com
+```
+
+## Suite (phase 3)
+
 - Auth JWT Supabase (intégration certif-academy)
-- Gate "5/5 chapitres terminés"
-- Déploiement Fly.io
+- Gate "5/5 chapitres terminés" côté API
+- Déploiement Fly.io (volume monté pour persister `chroma_db/`)
+- Ajout du second chatbot ISTQB Foundation (`corpus/foundation/syllabus/`)

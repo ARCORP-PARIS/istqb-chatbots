@@ -1,4 +1,11 @@
 openai>=1.0.0
 chromadb>=0.5.0
-streamlit>=1.30.0
 python-dotenv>=1.0.0
+
+# Streamlit : ancienne UI locale (app.py), conservée pour tests rapides.
+streamlit>=1.30.0
+
+# FastAPI : nouvelle API consommée par le frontend certif-academy (api.py).
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
