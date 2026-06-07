@@ -1,25 +1,34 @@
 """
 FastAPI server pour le chatbot ISTQB GenAI.
 
-Phase 2 — port depuis app.py (Streamlit).
+Phase 3 — port + auth JWT Supabase + déploiement Fly.io.
 
 Lancement local :
     uvicorn api:app --reload --port 8000
 
 Endpoints :
-    GET  /health  -> {"status": "ok", ...}
-    POST /chat    -> {"answer": "...", "sources": [...], "chapter_hint": "..."}
+    GET  /health  -> {"status": "ok", ...}   (PUBLIC, pas d'auth)
+    POST /chat    -> {"answer": "...", ...}  (AUTH REQUIRED : JWT Supabase)
 
-NB : la même base Chroma (./chroma_db) générée par `python ingest.py`
-est utilisée. Aucun appel réseau hors OpenAI.
+Auth :
+    Le client (frontend certif-academy) doit envoyer un header
+    `Authorization: Bearer <supabase-access-token>`. Le token est validé
+    localement avec `SUPABASE_JWT_SECRET` (HS256). Aucun appel réseau
+    vers Supabase n'est nécessaire pour la validation — c'est rapide et
+    sans dépendance externe au-delà d'OpenAI.
+
+NB : la base Chroma (./chroma_db en dev, /data/chroma_db sur Fly via
+volume monté) est générée par `python ingest.py`. Aucun appel réseau
+hors OpenAI à l'exécution.
 """
 
 import os
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
 import chromadb
+import jwt
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -36,19 +45,35 @@ if not OPENAI_API_KEY:
         "OPENAI_API_KEY manquant. Crée un fichier .env (cf .env.example)."
     )
 
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
+if not SUPABASE_JWT_SECRET:
+    raise RuntimeError(
+        "SUPABASE_JWT_SECRET manquant. Récupère-le sur Supabase Dashboard"
+        " → Project Settings → API → JWT Secret, et ajoute-le au .env."
+    )
+
+# Audience attendue dans le JWT Supabase. Toujours "authenticated" pour
+# les sessions utilisateur classiques (non anon).
+SUPABASE_JWT_AUDIENCE = os.getenv("SUPABASE_JWT_AUDIENCE", "authenticated")
+
 CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "istqb_knowledge")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4.1-mini")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
-# Liste blanche d'origines pour le dev local du frontend (Vite + Next).
-# En prod il faudra restreindre à l'origine du site déployé.
+# Liste blanche d'origines : dev local (Vite) + prod Lovable.
+# Surchargeable via env var ALLOWED_ORIGINS (CSV).
+DEFAULT_ORIGINS = ",".join(
+    [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "https://skill-architect-core.lovable.app",
+    ]
+)
 ALLOWED_ORIGINS = [
     o.strip()
-    for o in os.getenv(
-        "ALLOWED_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000",
-    ).split(",")
+    for o in os.getenv("ALLOWED_ORIGINS", DEFAULT_ORIGINS).split(",")
     if o.strip()
 ]
 
@@ -97,6 +122,69 @@ class ChatResponse(BaseModel):
     answer: str
     sources: List[str]
     chapter_hint: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Auth : JWT Supabase
+# ---------------------------------------------------------------------------
+
+
+def get_current_user(
+    authorization: Annotated[Optional[str], Header()] = None,
+) -> str:
+    """Valide localement le JWT Supabase envoyé par le frontend.
+
+    Le frontend (certif-academy) doit envoyer :
+        Authorization: Bearer <supabase-access-token>
+
+    Le token est signé en HS256 avec le secret JWT Supabase, donc on peut
+    le valider sans appel réseau. On renvoie le `sub` (user id Supabase),
+    qui pourra plus tard servir à appliquer la gate \"5/5 chapitres\".
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed Authorization header.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Empty bearer token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        payload = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            audience=SUPABASE_JWT_AUDIENCE,
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except jwt.InvalidTokenError:
+        # On reste volontairement vague pour ne pas guider un attaquant.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token missing subject.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user_id
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +364,14 @@ def health():
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def chat(
+    req: ChatRequest,
+    user_id: Annotated[str, Depends(get_current_user)],
+):
+    # `user_id` est le `sub` du JWT Supabase. On le récupère pour pouvoir
+    # logger / appliquer plus tard la gate "5/5 chapitres terminés".
+    _ = user_id
+
     # Mémoire : on garde les 10 derniers messages (5 échanges).
     history = req.history[-10:]
 

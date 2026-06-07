@@ -10,7 +10,7 @@ propre collection ChromaDB, mais partage le même code applicatif.
 
 ```
 istqb-chatbots/
-├── api.py              ← Application FastAPI (phase 2 — consommée par le frontend)
+├── api.py              ← Application FastAPI (phase 3 — auth JWT + déploiement Fly)
 ├── app.py              ← Ancienne UI Streamlit (conservée pour debug local)
 ├── ingest.py           ← Pipeline d'ingestion (chunke + embeddings + Chroma)
 ├── corpus/             ← Documents bruts, organisés par certification
@@ -19,6 +19,9 @@ istqb-chatbots/
 ├── chroma_db/          ← Vector store local (gitignored, régénéré via ingest.py)
 ├── venv/               ← Environnement Python (gitignored)
 ├── .env                ← Clés API (gitignored — voir .env.example)
+├── Dockerfile          ← Image prod (Python 3.11-slim + uvicorn)
+├── .dockerignore       ← Exclusions build (venv, .env, chroma_db local, …)
+├── fly.toml            ← Config Fly.io (région cdg, volume /data, /health)
 └── requirements.txt
 ```
 
@@ -117,9 +120,61 @@ et `http://127.0.0.1:5173`. Pour ajuster, définir `ALLOWED_ORIGINS` dans `.env`
 ALLOWED_ORIGINS=http://localhost:5173,https://certif-academy.example.com
 ```
 
-## Suite (phase 3)
+## Auth (phase 3)
 
-- Auth JWT Supabase (intégration certif-academy)
-- Gate "5/5 chapitres terminés" côté API
-- Déploiement Fly.io (volume monté pour persister `chroma_db/`)
+Le `POST /chat` exige un JWT Supabase. Le frontend doit envoyer :
+
+```
+Authorization: Bearer <supabase-access-token>
+```
+
+Le token est validé localement en HS256 avec `SUPABASE_JWT_SECRET`
+(Supabase Dashboard → Project Settings → API → JWT Secret). Aucun appel
+réseau vers Supabase. Un token absent / expiré / invalide → 401.
+
+`GET /health` reste public (sonde Fly.io).
+
+## Déploiement Fly.io
+
+L'app tourne sur Fly.io en région `cdg` (Paris) avec un volume monté sur
+`/data` pour persister `chroma_db/` entre les redémarrages.
+
+```bash
+# 0. Installer flyctl (une fois pour toutes)
+curl -L https://fly.io/install.sh | sh
+
+# 1. Login + créer l'app (sans déployer tout de suite)
+fly auth login
+fly launch --no-deploy --copy-config --name istqb-chatbots --region cdg
+
+# 2. Créer le volume qui hébergera /data/chroma_db
+fly volumes create chroma_data --region cdg --size 1
+
+# 3. Pousser les secrets (OpenAI + Supabase JWT)
+fly secrets set \
+  OPENAI_API_KEY=sk-... \
+  SUPABASE_JWT_SECRET=ton-supabase-jwt-secret
+
+# 4. Premier déploiement
+fly deploy
+
+# 5. Ingestion initiale (le volume est vide au premier boot)
+fly ssh console -C "python ingest.py"
+
+# 6. Vérifier
+curl https://istqb-chatbots.fly.dev/health
+```
+
+À chaque modification du corpus (`corpus/genai/syllabus/*.md`) :
+
+```bash
+fly deploy
+fly ssh console -C "python ingest.py"
+```
+
+## Suite
+
+- Gate "5/5 chapitres terminés" côté API (RPC Supabase appelée depuis
+  `get_current_user` ou un middleware dédié)
 - Ajout du second chatbot ISTQB Foundation (`corpus/foundation/syllabus/`)
+- Métriques d'usage par `user_id` (pour suivre l'utilisation)

@@ -9,3 +9,6 @@ streamlit>=1.30.0
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.0.0
+
+# JWT Supabase (HS256) : auth du POST /chat en phase 3.
+pyjwt>=2.8.0

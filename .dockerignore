@@ -1,0 +1,34 @@
+# Secrets / env
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+
+# Vector store généré localement — on régénère en prod via fly ssh console.
+chroma_db/
+
+# Streamlit (legacy UI) : pas embarqué dans l'image FastAPI.
+app.py
+
+# Git
+.git/
+.gitignore
+
+# Docs / IDE
+.vscode/
+.idea/
+.DS_Store
+*.log
+
+# Fly meta
+fly.toml
+.fly/
