@@ -270,6 +270,56 @@ def build_search_query(question: str, history: List[Message]) -> str:
     return f"{last_assistant}\n\nInstruction utilisateur : {question}"
 
 
+def rewrite_query_for_search(query: str) -> str:
+    """Reformule la question utilisateur en query de recherche enrichie pour
+    booster le rappel de l'embedding sur les questions courtes/vagues.
+
+    Ex : "donne les différents LLM"
+      → "types catégories LLM base instruction-tuned raisonnement multimodal vision"
+
+    Le but : transformer une question vague (qui embedde mal sur ChromaDB)
+    en une liste de mots-clés techniques alignés avec le vocabulaire du
+    syllabus ISTQB GenAI. Coût : ~$0.0001 + ~300ms par requête /chat.
+
+    Fail-soft : en cas d'erreur OpenAI ou de réponse vide, on retombe sur
+    la query d'origine pour ne pas dégrader l'UX.
+    """
+    try:
+        completion = openai_client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Tu reformules une question d'élève sur le syllabus "
+                        "ISTQB GenAI en une query de recherche enrichie pour "
+                        "un moteur vectoriel.\n"
+                        "Règles :\n"
+                        "- Garde le vocabulaire technique du syllabus (LLM, "
+                        "RAG, prompt injection, biais, hallucination, "
+                        "multimodal, instruction-tuned, raisonnement, ...).\n"
+                        "- Ajoute 3 à 6 synonymes / mots-clés liés.\n"
+                        "- Pas de phrase complète, juste des mots-clés "
+                        "séparés par des espaces.\n"
+                        "- Pas de ponctuation finale, pas de guillemets.\n"
+                        "- Réponds uniquement avec la query reformulée, "
+                        "rien d'autre."
+                    ),
+                },
+                {"role": "user", "content": query},
+            ],
+            temperature=0,
+            max_tokens=80,
+        )
+        rewritten = (completion.choices[0].message.content or "").strip()
+        # Filet de sécurité : si l'API renvoie vide ou trop court, fallback.
+        if len(rewritten) < 3:
+            return query
+        return rewritten
+    except Exception:
+        return query
+
+
 def retrieve_best_section(query: str):
     """V7 TOP-2 SECTIONS : top 20 chunks → groupés par (chapitre, section)
     → on concatène les 2 sections les plus matchées dans le contexte. Ça
@@ -432,6 +482,10 @@ def chat(
     history = req.history[-10:]
 
     search_query = build_search_query(req.question, history)
+    # Query rewriter : enrichit la query pour le moteur vectoriel. Sans ça,
+    # une question vague comme "donne les différents LLM" embedde mal et
+    # rate les sections 1.1.3 / 1.1.4 qui contiennent la vraie réponse.
+    search_query = rewrite_query_for_search(search_query)
 
     docs, all_metas, primary_meta = retrieve_best_section(search_query)
 
