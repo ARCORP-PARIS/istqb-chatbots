@@ -291,19 +291,31 @@ def rewrite_query_for_search(query: str) -> str:
                 {
                     "role": "system",
                     "content": (
-                        "Tu reformules une question d'élève sur le syllabus "
-                        "ISTQB GenAI en une query de recherche enrichie pour "
+                        "Tu reçois une question d'élève sur le syllabus ISTQB "
+                        "GenAI. Tu dois produire une query de recherche pour "
                         "un moteur vectoriel.\n"
-                        "Règles :\n"
-                        "- Garde le vocabulaire technique du syllabus (LLM, "
-                        "RAG, prompt injection, biais, hallucination, "
-                        "multimodal, instruction-tuned, raisonnement, ...).\n"
-                        "- Ajoute 3 à 6 synonymes / mots-clés liés.\n"
+                        "RÈGLES STRICTES :\n"
+                        "- REPRENDS d'abord les mots-clés EXACTS de la "
+                        "question (ne traduis JAMAIS, ne reformule JAMAIS un "
+                        "terme spécifique : 'IA fantôme' reste 'IA fantôme', "
+                        "'RAG' reste 'RAG', 'prompt injection' reste "
+                        "'prompt injection', etc.).\n"
+                        "- AJOUTE ENSUITE 3 à 6 synonymes ou mots-clés "
+                        "connexes du domaine ISTQB GenAI.\n"
                         "- Pas de phrase complète, juste des mots-clés "
                         "séparés par des espaces.\n"
                         "- Pas de ponctuation finale, pas de guillemets.\n"
-                        "- Réponds uniquement avec la query reformulée, "
-                        "rien d'autre."
+                        "- En cas de doute sur un terme, GARDE-le tel quel "
+                        "sans le remplacer.\n"
+                        "- Réponds uniquement avec la query, rien d'autre.\n"
+                        "Exemples :\n"
+                        "Q: 'c'est quoi un LLM' → 'LLM grand modèle de "
+                        "langage Transformer génératif pré-entraîné'\n"
+                        "Q: 'donne les différents LLM' → 'différents LLM "
+                        "types base instruction-tuned raisonnement "
+                        "multimodal vision'\n"
+                        "Q: 'IA fantôme' → 'IA fantôme shadow AI usage "
+                        "non autorisé sécurité conformité confidentialité'"
                     ),
                 },
                 {"role": "user", "content": query},
@@ -315,7 +327,11 @@ def rewrite_query_for_search(query: str) -> str:
         # Filet de sécurité : si l'API renvoie vide ou trop court, fallback.
         if len(rewritten) < 3:
             return query
-        return rewritten
+        # Belt-and-suspenders : on préfixe la query originale même si le
+        # rewriter est censé l'avoir reprise. Ça garantit que l'embedding
+        # garde le bon biais sémantique même si le rewriter dérape (ex:
+        # 'IA fantôme' interprété à tort en 'hallucination').
+        return f"{query} {rewritten}"
     except Exception:
         return query
 
