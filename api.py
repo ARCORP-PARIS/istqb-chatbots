@@ -12,10 +12,12 @@ Endpoints :
 
 Auth :
     Le client (frontend certif-academy) doit envoyer un header
-    `Authorization: Bearer <supabase-access-token>`. Le token est validé
-    localement avec `SUPABASE_JWT_SECRET` (HS256). Aucun appel réseau
-    vers Supabase n'est nécessaire pour la validation — c'est rapide et
-    sans dépendance externe au-delà d'OpenAI.
+    `Authorization: Bearer <supabase-access-token>`. La validation est
+    déléguée à Supabase en appelant `GET {SUPABASE_URL}/auth/v1/user`
+    avec le token. C'est un appel HTTP supplémentaire par requête /chat,
+    mais ça évite d'avoir besoin du JWT Secret (que Lovable Cloud ne nous
+    expose pas). Le `user.id` renvoyé est récupéré pour usage futur
+    (gate "5/5 chapitres", métriques).
 
 NB : la base Chroma (./chroma_db en dev, /data/chroma_db sur Fly via
 volume monté) est générée par `python ingest.py`. Aucun appel réseau
@@ -26,7 +28,7 @@ import os
 from typing import Annotated, List, Optional
 
 import chromadb
-import jwt
+import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,16 +47,25 @@ if not OPENAI_API_KEY:
         "OPENAI_API_KEY manquant. Crée un fichier .env (cf .env.example)."
     )
 
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
-if not SUPABASE_JWT_SECRET:
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+if not SUPABASE_URL:
     raise RuntimeError(
-        "SUPABASE_JWT_SECRET manquant. Récupère-le sur Supabase Dashboard"
-        " → Project Settings → API → JWT Secret, et ajoute-le au .env."
+        "SUPABASE_URL manquant. Format attendu : https://<ref>.supabase.co."
+        " Récupérable côté Lovable (var d'env du projet) ou sur Supabase."
+    )
+SUPABASE_URL = SUPABASE_URL.rstrip("/")
+
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+if not SUPABASE_ANON_KEY:
+    raise RuntimeError(
+        "SUPABASE_ANON_KEY manquant. C'est la \"publishable key\" du projet"
+        " Supabase (clé publique, exposable au navigateur)."
     )
 
-# Audience attendue dans le JWT Supabase. Toujours "authenticated" pour
-# les sessions utilisateur classiques (non anon).
-SUPABASE_JWT_AUDIENCE = os.getenv("SUPABASE_JWT_AUDIENCE", "authenticated")
+# URL absolue de l'endpoint qui sert à valider un access_token utilisateur.
+# Supabase répond 200 + JSON {id, email, ...} si le token est valide,
+# 401 sinon. Référence : https://supabase.com/docs/reference/api/auth
+SUPABASE_USER_ENDPOINT = f"{SUPABASE_URL}/auth/v1/user"
 
 CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "istqb_knowledge")
@@ -132,14 +143,19 @@ class ChatResponse(BaseModel):
 def get_current_user(
     authorization: Annotated[Optional[str], Header()] = None,
 ) -> str:
-    """Valide localement le JWT Supabase envoyé par le frontend.
+    """Valide le JWT Supabase en déléguant à Supabase.
 
     Le frontend (certif-academy) doit envoyer :
         Authorization: Bearer <supabase-access-token>
 
-    Le token est signé en HS256 avec le secret JWT Supabase, donc on peut
-    le valider sans appel réseau. On renvoie le `sub` (user id Supabase),
-    qui pourra plus tard servir à appliquer la gate \"5/5 chapitres\".
+    On délègue la validation à Supabase via `GET /auth/v1/user` : si la
+    réponse est 200, le token est bon et on récupère le `id` utilisateur.
+    Sinon → 401. C'est un appel HTTP par requête /chat (Supabase est
+    rapide, ~100ms ; on optimisera plus tard avec un cache court si
+    nécessaire).
+
+    Pourquoi pas de validation locale HS256 ? Parce que Lovable Cloud
+    gère le projet Supabase et n'expose pas le JWT Secret aux clients.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(
@@ -157,31 +173,44 @@ def get_current_user(
         )
 
     try:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            audience=SUPABASE_JWT_AUDIENCE,
+        resp = httpx.get(
+            SUPABASE_USER_ENDPOINT,
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {token}",
+            },
+            timeout=5.0,
         )
-    except jwt.ExpiredSignatureError:
+    except httpx.HTTPError as exc:
+        # Supabase joignable mais lent / TLS / DNS… on remonte un 503 pour
+        # que le frontend ne traite pas ça comme une erreur d'auth.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Auth provider unreachable: {exc}",
+        )
+
+    if resp.status_code != 200:
+        # Vague volontaire — pas la peine de dire à un attaquant si c'est
+        # le token qui est expiré ou mal formé.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expired.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except jwt.InvalidTokenError:
-        # On reste volontairement vague pour ne pas guider un attaquant.
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token.",
+            detail="Invalid or expired token.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    user_id = payload.get("sub")
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Auth provider returned non-JSON response.",
+        )
+
+    user_id = payload.get("id")
     if not user_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token missing subject.",
+            detail="Token user lookup returned no id.",
             headers={"WWW-Authenticate": "Bearer"},
         )
     return user_id

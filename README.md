@@ -128,9 +128,18 @@ Le `POST /chat` exige un JWT Supabase. Le frontend doit envoyer :
 Authorization: Bearer <supabase-access-token>
 ```
 
-Le token est validé localement en HS256 avec `SUPABASE_JWT_SECRET`
-(Supabase Dashboard → Project Settings → API → JWT Secret). Aucun appel
-réseau vers Supabase. Un token absent / expiré / invalide → 401.
+La validation est déléguée à Supabase : le backend fait un `GET
+{SUPABASE_URL}/auth/v1/user` avec le token + l'anon key. Si Supabase
+répond 200 → on récupère le `user.id` ; sinon → 401. Pas besoin du JWT
+Secret (Lovable Cloud ne l'expose pas). Coût : ~100 ms par /chat,
+optimisable plus tard avec un cache court si besoin.
+
+Variables d'env requises côté backend :
+
+```
+SUPABASE_URL=https://<project-ref>.supabase.co
+SUPABASE_ANON_KEY=eyJ...   # la "publishable key" du projet
+```
 
 `GET /health` reste public (sonde Fly.io).
 
@@ -150,10 +159,11 @@ fly launch --no-deploy --copy-config --name istqb-chatbots --region cdg
 # 2. Créer le volume qui hébergera /data/chroma_db
 fly volumes create chroma_data --region cdg --size 1
 
-# 3. Pousser les secrets (OpenAI + Supabase JWT)
+# 3. Pousser les secrets (OpenAI + Supabase URL + anon key)
 fly secrets set \
   OPENAI_API_KEY=sk-... \
-  SUPABASE_JWT_SECRET=ton-supabase-jwt-secret
+  SUPABASE_URL=https://<project-ref>.supabase.co \
+  SUPABASE_ANON_KEY=eyJ...
 
 # 4. Premier déploiement
 fly deploy

@@ -7,7 +7,8 @@
 # Avant le 1er deploy :
 #   fly launch --no-deploy --copy-config --name istqb-chatbots --region cdg
 #   fly volumes create chroma_data --region cdg --size 1
-#   fly secrets set OPENAI_API_KEY=... SUPABASE_JWT_SECRET=...
+#   fly secrets set OPENAI_API_KEY=... SUPABASE_URL=https://<ref>.supabase.co \
+#       SUPABASE_ANON_KEY=eyJ...
 #   fly deploy
 #   fly ssh console -C "python ingest.py"   # 1re ingestion dans /data/chroma_db
 # ---------------------------------------------------------------------------
@@ -20,7 +21,9 @@ primary_region = "cdg"
 
 [env]
   CHROMA_PATH = "/data/chroma_db"
-  SUPABASE_JWT_AUDIENCE = "authenticated"
+  # SUPABASE_URL + SUPABASE_ANON_KEY sont posés via `fly secrets set` (ils
+  # ne sont pas réellement secrets — l'anon key est publique — mais ça
+  # évite de les commit dans le repo).
   # ALLOWED_ORIGINS hérite des valeurs par défaut codées dans api.py
   # (Lovable prod + localhost dev). Surchargeable via `fly secrets set`.
 
