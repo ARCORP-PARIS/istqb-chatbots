@@ -337,11 +337,12 @@ def rewrite_query_for_search(query: str) -> str:
 
 
 def retrieve_best_section(query: str):
-    """V7 TOP-2 SECTIONS : top 20 chunks → groupés par (chapitre, section)
-    → on concatène les 2 sections les plus matchées dans le contexte. Ça
-    couvre les questions transverses (ex: "types de LLM" touche 1.1.3 ET
-    1.1.4) sans réintroduire le mélange chaotique d'origine. `primary_meta`
-    = section dominante (sert au hint chapitre côté UI)."""
+    """V8 BEST-DISTANCE SECTION : top 20 chunks → groupés par section →
+    on classe par **meilleur match** (distance min) plutôt que par nombre
+    de chunks. Évite qu'une section longue (ex: 3.2 sécurité) noie une
+    section courte mais ciblée (ex: 5.1.1 IA fantôme) juste parce qu'elle
+    a plus de chunks dans la base. On garde le top-2 pour les questions
+    transverses (ex: 'types LLM' = 1.1.3 + 1.1.4)."""
     q_emb = openai_client.embeddings.create(
         model=EMBED_MODEL,
         input=query,
@@ -355,21 +356,36 @@ def retrieve_best_section(query: str):
 
     docs = results["documents"][0] if results["documents"] else []
     metas = results["metadatas"][0] if results["metadatas"] else []
+    dists = (
+        results["distances"][0]
+        if results.get("distances")
+        else [float("inf")] * len(docs)
+    )
 
     if not docs:
         return [], [], None
 
     section_groups: dict = {}
-    for doc, meta in zip(docs, metas):
+    for doc, meta, dist in zip(docs, metas, dists):
         key = (meta.get("chapter", "NA"), meta.get("section", "NA"))
         if key not in section_groups:
-            section_groups[key] = {"docs": [], "meta": meta}
+            section_groups[key] = {
+                "docs": [],
+                "meta": meta,
+                "min_dist": dist,
+            }
+        else:
+            section_groups[key]["min_dist"] = min(
+                section_groups[key]["min_dist"], dist
+            )
         section_groups[key]["docs"].append(doc)
 
+    # Ranking par meilleur chunk de la section (distance min ascending).
+    # Une section ultra-pertinente avec 1 chunk bat une section moyennement
+    # pertinente avec 5 chunks.
     top_sections = sorted(
         section_groups.values(),
-        key=lambda x: len(x["docs"]),
-        reverse=True,
+        key=lambda x: x["min_dist"],
     )[:2]
 
     combined_docs: list = []
