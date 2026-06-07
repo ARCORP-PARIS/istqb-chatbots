@@ -271,8 +271,11 @@ def build_search_query(question: str, history: List[Message]) -> str:
 
 
 def retrieve_best_section(query: str):
-    """V6 MONO SECTION : top 12 chunks → groupés par (chapitre, section)
-    → on garde la section la plus matchée pour éviter le mélange de chapitres."""
+    """V7 TOP-2 SECTIONS : top 20 chunks → groupés par (chapitre, section)
+    → on concatène les 2 sections les plus matchées dans le contexte. Ça
+    couvre les questions transverses (ex: "types de LLM" touche 1.1.3 ET
+    1.1.4) sans réintroduire le mélange chaotique d'origine. `primary_meta`
+    = section dominante (sert au hint chapitre côté UI)."""
     q_emb = openai_client.embeddings.create(
         model=EMBED_MODEL,
         input=query,
@@ -280,7 +283,7 @@ def retrieve_best_section(query: str):
 
     results = collection.query(
         query_embeddings=[q_emb],
-        n_results=12,
+        n_results=20,
         where={"category": "syllabus"},
     )
 
@@ -297,8 +300,18 @@ def retrieve_best_section(query: str):
             section_groups[key] = {"docs": [], "meta": meta}
         section_groups[key]["docs"].append(doc)
 
-    best = max(section_groups.values(), key=lambda x: len(x["docs"]))
-    return best["docs"], metas, best["meta"]
+    top_sections = sorted(
+        section_groups.values(),
+        key=lambda x: len(x["docs"]),
+        reverse=True,
+    )[:2]
+
+    combined_docs: list = []
+    for s in top_sections:
+        combined_docs.extend(s["docs"])
+
+    primary_meta = top_sections[0]["meta"] if top_sections else None
+    return combined_docs, metas, primary_meta
 
 
 # Prompt repris quasi-mot pour mot depuis app.py (juste isolé en constante).
@@ -317,9 +330,9 @@ PÉRIMÈTRE :
 - Utilise l'historique si la question est implicite.
 
 FIABILITÉ :
-- N'invente jamais.
-- Si absent du syllabus :
-"Je n'ai pas trouvé cette information dans la formation."
+- N'invente jamais d'informations qui contredisent le contexte fourni.
+- Si la question porte sur une notion adjacente présente dans le contexte (même partiellement), réponds avec ce que tu trouves en commençant par : "Le syllabus n'aborde pas directement ce point, mais voici les éléments liés :".
+- Ne réponds "Je n'ai pas trouvé cette information dans la formation." QUE si le contexte fourni n'a vraiment AUCUN rapport avec la question.
 
 MÉMOIRE :
 - Utilise l'historique pour comprendre :
