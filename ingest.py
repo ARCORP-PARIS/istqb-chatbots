@@ -9,8 +9,12 @@ load_dotenv()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-CHROMA_PATH = "./chroma_db"
-COLLECTION_NAME = "istqb_knowledge"
+# CHROMA_PATH : respecte la même env var que api.py. En local → ./chroma_db,
+# en prod sur Fly → /data/chroma_db (volume monté). Indispensable sinon
+# l'ingestion en prod écrirait dans le système de fichiers éphémère du
+# container et l'API ne verrait rien.
+CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "istqb_knowledge")
 # Phase 2 : on ingère uniquement le syllabus officiel ISTQB GenAI.
 # Les autres sous-dossiers (cours/, faq/, quiz/, revision/) sont volontairement
 # ignorés : le site a déjà cours + quiz, le bot ne sert qu'à la révision basée

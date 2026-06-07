@@ -1,57 +1,44 @@
-# ---------------------------------------------------------------------------
-# fly.toml — config Fly.io pour istqb-chatbots
-# ---------------------------------------------------------------------------
-# Région : cdg (Paris). Change si tu préfères une autre région.
-# Volume : `chroma_data` (1Go suffit largement pour le syllabus GenAI).
+# fly.toml app configuration file generated for istqb-chatbots on 2026-06-07T16:42:05+02:00
 #
-# Avant le 1er deploy :
-#   fly launch --no-deploy --copy-config --name istqb-chatbots --region cdg
-#   fly volumes create chroma_data --region cdg --size 1
-#   fly secrets set OPENAI_API_KEY=... SUPABASE_URL=https://<ref>.supabase.co
-#   fly deploy
-#   fly ssh console -C "python ingest.py"   # 1re ingestion dans /data/chroma_db
-# ---------------------------------------------------------------------------
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "istqb-chatbots"
-primary_region = "cdg"
+app = 'istqb-chatbots'
+primary_region = 'cdg'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  CHROMA_PATH = "/data/chroma_db"
-  # SUPABASE_URL est posé via `fly secrets set` (n'est pas réellement
-  # secret — c'est juste l'URL du projet — mais ça évite de la commit
-  # dans le repo public).
-  # ALLOWED_ORIGINS hérite des valeurs par défaut codées dans api.py
-  # (Lovable prod + localhost dev). Surchargeable via `fly secrets set`.
+  CHROMA_PATH = '/data/chroma_db'
+
+[[mounts]]
+  source = 'chroma_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8000
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
-  processes = ["app"]
+  processes = ['app']
 
   [http_service.concurrency]
-    type = "requests"
-    soft_limit = 20
+    type = 'requests'
     hard_limit = 25
+    soft_limit = 20
 
-  # Sonde santé : /health est public (pas de JWT requis).
   [[http_service.checks]]
-    interval = "30s"
-    timeout = "5s"
-    grace_period = "10s"
-    method = "GET"
-    path = "/health"
-
-[[mounts]]
-  source = "chroma_data"
-  destination = "/data"
+    interval = '30s'
+    timeout = '5s'
+    # 30s : Python + chromadb + openai prennent ~5-10s à importer au
+    # cold start ; on laisse de la marge pour éviter les faux négatifs.
+    grace_period = '30s'
+    method = 'GET'
+    path = '/health'
 
 [[vm]]
-  cpu_kind = "shared"
+  memory = '1gb'
   cpus = 1
   memory_mb = 1024

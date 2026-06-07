@@ -96,7 +96,11 @@ ALLOWED_ORIGINS = [
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-collection = chroma_client.get_collection(name=COLLECTION_NAME)
+# get_or_create_collection : permet à l'app de booter même si le volume
+# Fly est encore vide (cas du tout 1er déploiement, avant ingest.py).
+# Sans ça, get_collection() lèverait NotFoundError et l'app crashait
+# au démarrage → healthcheck KO → deploy timeout.
+collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
 
 # JWKS Supabase : récupère et cache la clé publique ES256. La 1re requête
 # /chat après le démarrage fait un appel réseau pour fetch les keys, puis
