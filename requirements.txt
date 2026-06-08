@@ -14,3 +14,8 @@ pydantic>=2.0.0
 # (intégré à pyjwt) fetch le JWKS public et le cache 1h. L'extra [crypto]
 # installe le package `cryptography` requis pour ES256 (NIST P-256).
 pyjwt[crypto]>=2.8.0
+
+# Phase 4 : appel REST à Supabase pour la gate "5/5 chapitres" (RPC
+# is_chatbot_unlocked). httpx est déjà tiré comme sous-dépendance par
+# openai SDK, on le re-déclare explicitement pour ne pas dépendre du hasard.
+httpx>=0.27.0

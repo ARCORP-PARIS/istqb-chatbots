@@ -26,9 +26,11 @@ hors OpenAI à l'exécution.
 """
 
 import os
+import time
 from typing import Annotated, List, Optional
 
 import chromadb
+import httpx
 import jwt
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -73,6 +75,39 @@ CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "istqb_knowledge")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4.1-mini")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+
+# Phase 4 — Gate "5/5 chapitres terminés OU admin override".
+# On appelle une RPC Supabase `is_chatbot_unlocked()` qui retourne TRUE/FALSE
+# pour l'utilisateur courant. La RPC est SECURITY DEFINER côté Supabase et
+# utilise auth.uid() en interne, donc impossible de chercher l'unlock status
+# d'un autre user.
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+# Bypass de la gate (uniquement utile en dev local). Refuse explicitement
+# d'être à TRUE en prod via un check au démarrage.
+CHATBOT_GATE_DISABLED = (
+    os.getenv("CHATBOT_GATE_DISABLED", "false").lower() == "true"
+)
+# TTL du cache d'unlock par user (en secondes). 5 min = bon compromis :
+# si admin débloque un élève, il peut attendre max 5 min avant que la gate
+# le laisse passer. Évite de hammerer Supabase à chaque message du bot.
+UNLOCK_CACHE_TTL = int(os.getenv("UNLOCK_CACHE_TTL", "300"))
+
+# Refus explicite : on n'autorise pas le bypass de la gate hors environnement
+# de dev. La var est conçue pour le test local uniquement.
+FLY_APP_NAME = os.getenv("FLY_APP_NAME")  # défini auto par Fly.io
+if CHATBOT_GATE_DISABLED and FLY_APP_NAME:
+    raise RuntimeError(
+        "CHATBOT_GATE_DISABLED=true détecté en environnement Fly. "
+        "Cette variable est réservée au dev local. Refuse de démarrer."
+    )
+
+# Refus explicite : sans la SUPABASE_ANON_KEY on ne peut pas appeler la RPC
+# de gate. On laisse cependant passer en dev si CHATBOT_GATE_DISABLED=true.
+if not SUPABASE_ANON_KEY and not CHATBOT_GATE_DISABLED:
+    raise RuntimeError(
+        "SUPABASE_ANON_KEY manquant. Indispensable pour appeler la RPC "
+        "is_chatbot_unlocked. Renseigne-le dans .env (cf .env.example)."
+    )
 
 # Liste blanche d'origines : dev local (Vite) + prod Lovable.
 # Surchargeable via env var ALLOWED_ORIGINS (CSV).
@@ -228,6 +263,94 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return user_id
+
+
+def get_bearer_token(
+    authorization: Annotated[Optional[str], Header()] = None,
+) -> str:
+    """Extrait le JWT brut du header Authorization, sans le revalider.
+
+    On a déjà `get_current_user` qui valide la signature ES256. Ici on
+    veut juste réutiliser le même JWT pour le forward à Supabase (RPC
+    `is_chatbot_unlocked`). FastAPI déduplique les appels au header
+    Authorization, donc on peut déclarer les deux dépendances sans
+    second appel réseau.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        # Cas théoriquement déjà couvert par get_current_user, mais on
+        # double-check pour ne pas laisser passer un appel direct.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return authorization.split(" ", 1)[1].strip()
+
+
+# ---------------------------------------------------------------------------
+# Gate : 5/5 chapitres terminés OU admin override (RPC Supabase)
+# ---------------------------------------------------------------------------
+
+# Cache mémoire {user_id: (unlocked_bool, expires_at_epoch)}. On évite de
+# hammerer Supabase à chaque message envoyé au bot. TTL configurable via
+# UNLOCK_CACHE_TTL (5 min par défaut). Tradeoff : si l'admin débloque un
+# élève en plein milieu d'une session, le débloque effectif peut prendre
+# jusqu'à UNLOCK_CACHE_TTL secondes côté backend.
+_unlock_cache: dict[str, tuple[bool, float]] = {}
+
+
+def is_chatbot_unlocked_for_user(user_id: str, jwt_token: str) -> bool:
+    """Appelle la RPC Supabase `is_chatbot_unlocked` pour l'utilisateur
+    courant. Renvoie True si l'élève a accès au chatbot (5/5 chapitres
+    terminés OU `chatbot_unlocked_by_admin = true`), False sinon.
+
+    On forward le JWT user en `Authorization: Bearer …` ET on ajoute
+    l'anon key dans le header `apikey` : c'est la convention REST
+    Supabase pour les RPC. La fonction RPC utilise `auth.uid()` en
+    interne (extrait du JWT) pour identifier l'élève — impossible donc
+    de demander l'unlock d'un autre user.
+
+    Comportement strict : en cas d'erreur réseau ou de réponse non-200,
+    on retourne False (= bloqué). Vaut mieux refuser temporairement le
+    chat qu'ouvrir une faille d'autorisation. L'erreur est logguée via
+    le HTTPException levée en amont par le endpoint.
+    """
+    # Dev only bypass : utile pour développer en local sans avoir à
+    # finir les 5 chapitres. Refus explicite en prod côté config (cf
+    # check FLY_APP_NAME au démarrage).
+    if CHATBOT_GATE_DISABLED:
+        return True
+
+    # Cache hit ?
+    now = time.time()
+    cached = _unlock_cache.get(user_id)
+    if cached and cached[1] > now:
+        return cached[0]
+
+    # Cache miss : appel REST RPC Supabase.
+    url = f"{SUPABASE_URL}/rest/v1/rpc/is_chatbot_unlocked"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {jwt_token}",
+        "apikey": SUPABASE_ANON_KEY or "",
+    }
+    try:
+        resp = httpx.post(url, headers=headers, json={}, timeout=5.0)
+    except httpx.HTTPError:
+        # Réseau KO. On ne met PAS en cache (false négatif transitoire).
+        return False
+
+    if resp.status_code != 200:
+        return False
+
+    # La RPC retourne un bool brut (`true` / `false`).
+    try:
+        unlocked = bool(resp.json())
+    except ValueError:
+        return False
+
+    _unlock_cache[user_id] = (unlocked, now + UNLOCK_CACHE_TTL)
+    return unlocked
 
 
 # ---------------------------------------------------------------------------
@@ -505,10 +628,22 @@ def health():
 def chat(
     req: ChatRequest,
     user_id: Annotated[str, Depends(get_current_user)],
+    bearer_token: Annotated[str, Depends(get_bearer_token)],
 ):
-    # `user_id` est le `sub` du JWT Supabase. On le récupère pour pouvoir
-    # logger / appliquer plus tard la gate "5/5 chapitres terminés".
-    _ = user_id
+    # Gate "5/5 chapitres terminés OU admin override". Défense en
+    # profondeur : le frontend cache déjà le widget tant que cette RPC
+    # ne renvoie pas true, mais quelqu'un qui appellerait /chat
+    # directement (curl, repost depuis l'inspector…) doit aussi être
+    # bloqué côté serveur. On répond 403 (pas 401) pour distinguer "JWT
+    # valide mais pas autorisé" de "JWT invalide".
+    if not is_chatbot_unlocked_for_user(user_id, bearer_token):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Chatbot non débloqué. Termine les 5 chapitres du syllabus "
+                "(ou demande à un admin de débloquer manuellement)."
+            ),
+        )
 
     # Mémoire : on garde les 10 derniers messages (5 échanges).
     history = req.history[-10:]
