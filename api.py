@@ -87,10 +87,24 @@ SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 CHATBOT_GATE_DISABLED = (
     os.getenv("CHATBOT_GATE_DISABLED", "false").lower() == "true"
 )
-# TTL du cache d'unlock par user (en secondes). 5 min = bon compromis :
-# si admin débloque un élève, il peut attendre max 5 min avant que la gate
-# le laisse passer. Évite de hammerer Supabase à chaque message du bot.
-UNLOCK_CACHE_TTL = int(os.getenv("UNLOCK_CACHE_TTL", "300"))
+# TTL du cache d'unlock par user (en secondes). 60s = aligné sur le polling
+# Lovable côté front (qui re-check toutes les 30s). Sans alignement, un
+# admin peut débloquer un élève, le widget apparaître (front), mais le
+# backend continuer à renvoyer 403 pendant plusieurs minutes — UX cassée.
+UNLOCK_CACHE_TTL = int(os.getenv("UNLOCK_CACHE_TTL", "60"))
+
+# Taille max du cache d'unlock (anti-leak mémoire si un attaquant essaie
+# de générer des JWT bidons avec des `sub` aléatoires). Au-delà on évince
+# les entrées expirées puis, si encore trop, on coupe la moitié la plus
+# ancienne.
+UNLOCK_CACHE_MAX_SIZE = int(os.getenv("UNLOCK_CACHE_MAX_SIZE", "10000"))
+
+# Rate limit /chat : pour éviter qu'un élève (ou un attaquant avec un JWT
+# valide) spamme l'endpoint et brûle ton budget OpenAI. Sliding window
+# par user_id, en mémoire. Volontairement large pour un usage humain
+# normal (~1 msg / 3s en pointe).
+CHAT_RATE_LIMIT_MAX = int(os.getenv("CHAT_RATE_LIMIT_MAX", "20"))
+CHAT_RATE_LIMIT_WINDOW = int(os.getenv("CHAT_RATE_LIMIT_WINDOW", "60"))
 
 # Refus explicite : on n'autorise pas le bypass de la gate hors environnement
 # de dev. La var est conçue pour le test local uniquement.
@@ -293,10 +307,78 @@ def get_bearer_token(
 
 # Cache mémoire {user_id: (unlocked_bool, expires_at_epoch)}. On évite de
 # hammerer Supabase à chaque message envoyé au bot. TTL configurable via
-# UNLOCK_CACHE_TTL (5 min par défaut). Tradeoff : si l'admin débloque un
-# élève en plein milieu d'une session, le débloque effectif peut prendre
-# jusqu'à UNLOCK_CACHE_TTL secondes côté backend.
+# UNLOCK_CACHE_TTL (60s par défaut, aligné sur le polling front).
 _unlock_cache: dict[str, tuple[bool, float]] = {}
+
+
+def _evict_unlock_cache(now: float) -> None:
+    """Nettoie le cache d'unlock pour éviter une croissance non bornée.
+
+    Stratégie en 2 temps : on supprime d'abord toutes les entrées expirées,
+    puis si on est toujours au-dessus du seuil, on coupe la moitié la plus
+    ancienne. Pas de Redis, pas d'eviction LRU sophistiquée — c'est un
+    chatbot de révision, pas un cache de prod massif.
+    """
+    if len(_unlock_cache) < UNLOCK_CACHE_MAX_SIZE:
+        return
+    # Phase 1 : drop les entrées expirées.
+    expired = [k for k, (_, exp) in _unlock_cache.items() if exp <= now]
+    for k in expired:
+        _unlock_cache.pop(k, None)
+    if len(_unlock_cache) < UNLOCK_CACHE_MAX_SIZE:
+        return
+    # Phase 2 : coupe la moitié la plus ancienne (par expiration).
+    ordered = sorted(_unlock_cache.items(), key=lambda kv: kv[1][1])
+    for k, _ in ordered[: len(ordered) // 2]:
+        _unlock_cache.pop(k, None)
+
+
+# Rate limit /chat : sliding window in-memory {user_id: [timestamps]}.
+# On est mono-process Fly (1 machine pour l'instant), donc un dict suffit.
+# Si tu scales un jour : Redis ou Fly Volumes partagés. À ce moment-là
+# tu auras d'autres problèmes (état partagé) qui justifient la migration.
+_rate_limit_log: dict[str, list[float]] = {}
+
+
+def check_chat_rate_limit(user_id: str) -> None:
+    """Lève 429 si l'utilisateur dépasse CHAT_RATE_LIMIT_MAX messages
+    dans la dernière fenêtre CHAT_RATE_LIMIT_WINDOW secondes.
+
+    Protections couvertes :
+    - élève qui spam volontairement (test d'amusement, bug d'UI),
+    - script qui automatise des questions pour scrapper le syllabus,
+    - JWT compromis qui boucle pour brûler ton budget OpenAI.
+
+    Le header Retry-After est renseigné pour que le front puisse afficher
+    un message correct ("réessaye dans X secondes") plutôt qu'un 429 nu.
+    """
+    now = time.time()
+    window_start = now - CHAT_RATE_LIMIT_WINDOW
+    timestamps = _rate_limit_log.setdefault(user_id, [])
+    # Drop les timestamps hors fenêtre.
+    timestamps[:] = [t for t in timestamps if t > window_start]
+    if len(timestamps) >= CHAT_RATE_LIMIT_MAX:
+        retry_after = max(1, int(timestamps[0] + CHAT_RATE_LIMIT_WINDOW - now) + 1)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Trop de questions en peu de temps. Réessaye dans "
+                f"{retry_after} secondes."
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
+    timestamps.append(now)
+
+    # Garde-fou anti-leak : si le log dépasse 10x la limite, on coupe.
+    # Évite la rétention pour des users actifs il y a 10min.
+    if len(_rate_limit_log) > UNLOCK_CACHE_MAX_SIZE:
+        stale = [
+            uid
+            for uid, ts in _rate_limit_log.items()
+            if not ts or ts[-1] < window_start
+        ]
+        for uid in stale:
+            _rate_limit_log.pop(uid, None)
 
 
 def is_chatbot_unlocked_for_user(user_id: str, jwt_token: str) -> bool:
@@ -350,6 +432,7 @@ def is_chatbot_unlocked_for_user(user_id: str, jwt_token: str) -> bool:
         return False
 
     _unlock_cache[user_id] = (unlocked, now + UNLOCK_CACHE_TTL)
+    _evict_unlock_cache(now)
     return unlocked
 
 
@@ -644,6 +727,12 @@ def chat(
                 "(ou demande à un admin de débloquer manuellement)."
             ),
         )
+
+    # Rate limit : protège ton budget OpenAI. À placer APRÈS la gate
+    # pour ne pas compter les requêtes refusées pour cause de gate dans
+    # le quota (sinon un élève bloqué pourrait épuiser son quota en
+    # appelant /chat avant même d'avoir terminé un chapitre).
+    check_chat_rate_limit(user_id)
 
     # Mémoire : on garde les 10 derniers messages (5 échanges).
     history = req.history[-10:]
